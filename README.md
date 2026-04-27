@@ -1,6 +1,6 @@
 # Brusca.Infrastructure
 
-Concrete infrastructure implementations for the Brusca AI-powered file organizer. This library implements every interface defined in [`Brusca.Core`](../Brusca.Core) using real I/O providers: SQL Server via Dapper, Claude via Anthropic.SDK, Serilog for error logging, and Audit.NET for audit logging.
+Concrete infrastructure implementations for the Brusca AI-powered file organizer. This library implements every interface defined in [`Brusca.Core`](https://github.com/Out-Of-Box-Thinking/Brusca.Core) using real I/O providers
 
 ---
 
@@ -41,7 +41,7 @@ All database access calls stored procedures using the naming convention:
 schema.usp_Entity_Action    e.g.  cleaning.usp_Cleaning_Create
 ```
 
-The application SQL login has **EXECUTE-only** permission — no direct table access. See the [`Brusca.Api`](../Brusca.Api) repo for all SQL scripts.
+The application SQL login has **EXECUTE-only** permission — no direct table access. See the [`Brusca.Api`](https://github.com/Out-Of-Box-Thinking/Brusca.Api) repo for all SQL scripts.
 
 ---
 
@@ -84,6 +84,7 @@ Published as the **`Brusca.Infrastructure`** NuGet package. Bump the version in 
 
 | Repo | Role |
 |------|------|
-| [Brusca.Core](../Brusca.Core) | Domain kernel — interfaces and models |
-| [Brusca.Api](../Brusca.Api) | ASP.NET Core 9 host, REST API |
-| [Brusca.Tests](../Brusca.Tests) | xUnit integration and unit tests |
+| [Brusca.Core](https://github.com/Out-Of-Box-Thinking/Brusca.Core) | Domain kernel — interfaces and models |
+| [Brusca.Api](https://github.com/Out-Of-Box-Thinking/Brusca.Api) | ASP.NET Core 9 host, REST API |
+| [Brusca.Tests](https://github.com/Out-Of-Box-Thinking/Brusca.Tests) | xUnit integration and unit tests |
+| [Brusca.Web](https://github.com/Out-Of-Box-Thinking/Brusca.Web) | Astro 5 front-end |
