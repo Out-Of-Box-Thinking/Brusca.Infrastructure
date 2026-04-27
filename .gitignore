@@ -1,0 +1,19 @@
+## .NET
+*.user
+*.suo
+bin/
+obj/
+.vs/
+*.log
+
+## NuGet output
+nupkgs/
+*.nupkg
+
+## Secrets
+appsettings.Development.json
+secrets.json
+
+## OS
+.DS_Store
+Thumbs.db
