@@ -80,6 +80,25 @@ Published as the **`Brusca.Infrastructure`** NuGet package. Bump the version in 
 
 ---
 
+## Continuous integration
+
+| Workflow | Trigger | What it does |
+|----------|---------|--------------|
+| [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | Push or PR to `main` | `dotnet restore` → `dotnet build` → `dotnet pack` → uploads `*.nupkg` artifact |
+| [`.github/workflows/release.yml`](.github/workflows/release.yml) | Push of a `v*` tag | Packs with version derived from the tag (strips leading `v`) and pushes to **GitHub Packages**; also pushes to **NuGet.org** when the `NUGET_API_KEY` secret is set |
+
+### Cutting a release
+
+```powershell
+# Bump <Version> in Brusca.Infrastructure/Brusca.Infrastructure.csproj first if you want it embedded in the assembly
+git tag v1.0.1
+git push origin v1.0.1
+```
+
+The release workflow uses the built-in `GITHUB_TOKEN` to push to GitHub Packages — no extra setup required. To also publish to NuGet.org, add a repo secret named `NUGET_API_KEY`.
+
+---
+
 ## Related repositories
 
 | Repo | Role |
