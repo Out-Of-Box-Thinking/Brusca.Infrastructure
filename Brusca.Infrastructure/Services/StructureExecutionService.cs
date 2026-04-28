@@ -136,14 +136,15 @@ public sealed partial class StructureExecutionService : IStructureExecutionServi
                 relocations.Add(dirRec);
             }
 
-            // Move + rename record
+            // Move + rename record.
+            // Brusca treats originals as strictly read-only — every file
+            // operation is a Materialize (copy). The OperationType is fixed
+            // regardless of whether ExecutionTarget is SourcePath or AlternatePath.
             var fileRec = new FileRelocationRecord
             {
                 CleaningId      = cleaningId,
                 RedactedFileId  = file.Id,
-                OperationType   = cleaning.ExecutionTarget == ExecutionTarget.SourcePath
-                                  ? RelocationOperationType.Move
-                                  : RelocationOperationType.Materialize,
+                OperationType   = RelocationOperationType.Materialize,
                 ExecutionTarget = cleaning.ExecutionTarget,
                 BeforePath      = file.OriginalFilePath,
                 BeforeName      = file.OriginalFileName,
@@ -153,16 +154,10 @@ public sealed partial class StructureExecutionService : IStructureExecutionServi
             };
             try
             {
-                if (cleaning.ExecutionTarget == ExecutionTarget.SourcePath)
-                {
-                    if (File.Exists(file.OriginalFilePath))
-                        File.Move(file.OriginalFilePath, newPath, overwrite: false);
-                }
-                else
-                {
-                    if (File.Exists(file.OriginalFilePath))
-                        File.Copy(file.OriginalFilePath, newPath, overwrite: false);
-                }
+                // Always copy — the original at BeforePath remains untouched.
+                if (File.Exists(file.OriginalFilePath))
+                    File.Copy(file.OriginalFilePath, newPath, overwrite: false);
+
                 fileRec.Status = RelocationStatus.Succeeded;
                 fileRec.CompletedAtUtc = DateTime.UtcNow;
 
