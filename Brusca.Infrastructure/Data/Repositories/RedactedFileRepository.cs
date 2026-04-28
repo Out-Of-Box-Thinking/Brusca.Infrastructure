@@ -35,6 +35,7 @@ public sealed class RedactedFileRepository : DapperRepositoryBase, IRedactedFile
                 descriptor.PiiSegmentCount,
                 descriptor.ContentHash,
                 descriptor.ImageRedactionRegionsJson,
+                descriptor.SlotMapJson,
                 descriptor.DiscoveredAtUtc
             }, ct);
             return Result.Ok(descriptor);
@@ -165,6 +166,21 @@ public sealed class RedactedFileRepository : DapperRepositoryBase, IRedactedFile
             }).ToList();
 
             return Result.Ok<IReadOnlyList<DuplicateGroup>>(groups);
+        }
+        catch (Exception ex) { return Result.Fail(new ExceptionalError(ex)); }
+    }
+
+    public async Task<Result> UpdateSlotMapAsync(
+        Guid redactedFileId, string slotMapJson, CancellationToken ct = default)
+    {
+        try
+        {
+            await ExecuteAsync("cleaning.usp_RedactedFile_UpdateSlotMap", new
+            {
+                Id = redactedFileId,
+                SlotMapJson = slotMapJson
+            }, ct);
+            return Result.Ok();
         }
         catch (Exception ex) { return Result.Fail(new ExceptionalError(ex)); }
     }

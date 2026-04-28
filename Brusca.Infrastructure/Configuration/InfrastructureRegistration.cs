@@ -43,6 +43,9 @@ public static class InfrastructureRegistration
         services.AddScoped<ITreeProjectionService, TreeProjectionService>();
         services.AddScoped<IPiiRedactionService, RegexPiiRedactionService>();
         services.AddScoped<IPiiRehydrationService, PiiRehydrationService>();
+        services.AddSingleton<IPathSafetyService, PathSafetyService>();
+        services.AddScoped<IPiiSlotMappingService, ClaudePiiSlotMappingService>();
+        services.AddScoped<ISlotCompletenessValidator, SlotCompletenessValidator>();
         services.AddScoped<IDocumentTypeClassifier, HeuristicDocumentTypeClassifier>();
         services.AddScoped<IStructureExecutionService, StructureExecutionService>();
         services.AddScoped<IDuplicateDetectionService, DuplicateDetectionService>();

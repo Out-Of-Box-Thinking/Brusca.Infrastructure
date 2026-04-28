@@ -35,6 +35,8 @@ public sealed partial class CleaningService : ICleaningService
     private readonly ClaudePromptService _claude;
     private readonly IAuditLogger _audit;
     private readonly IErrorLogger _log;
+    private readonly IPiiSlotMappingService? _slotMapper;
+    private readonly ISlotCompletenessValidator? _slotValidator;
 
     public CleaningService(
         ICleaningRepository cleaningRepo,
@@ -57,7 +59,9 @@ public sealed partial class CleaningService : ICleaningService
         IAuditLogger audit,
         IErrorLogger log,
         IPromotionService? promotion = null,
-        IImageRedactionService? imageRedactor = null)
+        IImageRedactionService? imageRedactor = null,
+        IPiiSlotMappingService? slotMapper = null,
+        ISlotCompletenessValidator? slotValidator = null)
     {
         _cleaningRepo    = cleaningRepo;
         _promptRepo      = promptRepo;
@@ -80,6 +84,8 @@ public sealed partial class CleaningService : ICleaningService
         _claude          = claude;
         _audit           = audit;
         _log             = log;
+        _slotMapper      = slotMapper;
+        _slotValidator   = slotValidator;
     }
 
     public async Task<Result<Cleaning>> StartCleaningAsync(

@@ -33,6 +33,7 @@ public sealed partial class StructureExecutionService : IStructureExecutionServi
     private readonly IImageRedactionService? _imageRedactor;
     private readonly IFileMetadataStripper? _metadataStripper;
     private readonly IDuplicateDetectionService _dupes;
+    private readonly IPathSafetyService _paths;
     private readonly MaterializationOptions _materialization;
     private readonly IAuditLogger _audit;
     private readonly IErrorLogger _log;
@@ -46,6 +47,7 @@ public sealed partial class StructureExecutionService : IStructureExecutionServi
         IEncryptionService crypto,
         IFileHashService hash,
         IDuplicateDetectionService dupes,
+        IPathSafetyService paths,
         IOptions<BruscaOptions> options,
         IAuditLogger audit,
         IErrorLogger log,
@@ -60,6 +62,7 @@ public sealed partial class StructureExecutionService : IStructureExecutionServi
         _crypto          = crypto;
         _hash            = hash;
         _dupes           = dupes;
+        _paths           = paths;
         _materialization = options.Value.Materialization;
         _audit           = audit;
         _log             = log;
@@ -410,6 +413,9 @@ public sealed partial class StructureExecutionService : IStructureExecutionServi
 
         var (nonKeepers, keeperPathById) = await ResolveDuplicatesAsync(cleaningId, files, ct);
         var planned = new List<FileRelocationRecord>();
+        // Intra-plan collision tracker: when two files compute the same AfterPath
+        // (e.g. identical token values), suffix the second/third with "_(2)", "_(3)".
+        var claimed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var file in files)
         {
@@ -464,6 +470,25 @@ public sealed partial class StructureExecutionService : IStructureExecutionServi
             var newName   = $"{fileBase}{file.Extension}";
             var newDir    = Path.Combine(executionRoot, folderRel);
             var newPath   = Path.Combine(newDir, newName);
+
+            // Intra-plan collision: two files in this same planning pass mapping
+            // to the same AfterPath. Suffix to disambiguate before persistence.
+            if (!claimed.Add(newPath))
+            {
+                var stem = Path.GetFileNameWithoutExtension(newName);
+                var ext  = Path.GetExtension(newName);
+                for (int i = 2; i < 1000; i++)
+                {
+                    var candidateName = $"{stem}_({i}){ext}";
+                    var candidatePath = Path.Combine(newDir, candidateName);
+                    if (claimed.Add(candidatePath))
+                    {
+                        newName = candidateName;
+                        newPath = candidatePath;
+                        break;
+                    }
+                }
+            }
 
             var rec = new FileRelocationRecord
             {
@@ -560,11 +585,22 @@ public sealed partial class StructureExecutionService : IStructureExecutionServi
             {
                 var json = _crypto.Decrypt(file.EncryptedPiiJson);
                 var segments = JsonSerializer.Deserialize<List<PiiSegment>>(json) ?? [];
+                var byOrdinal = segments.ToDictionary(s => s.Ordinal);
+
+                // 1) Per-file slot map wins over kind-fallback when present.
+                var slotMap = ParseSlotMap(file.SlotMapJson);
+                foreach (var (slot, ordinal) in slotMap)
+                {
+                    if (byOrdinal.TryGetValue(ordinal, out var seg))
+                        tokens[slot] = _paths.SanitizeSegment(seg.Value);
+                }
+
+                // 2) Kind-keyed fallback for any unmapped {{Kind}} placeholder.
                 foreach (var s in segments)
                 {
                     var key = s.Kind.ToString();
                     if (!tokens.ContainsKey(key))
-                        tokens[key] = SafeForPath(s.Value);
+                        tokens[key] = _paths.SanitizeSegment(s.Value);
                 }
             }
             catch
@@ -575,18 +611,34 @@ public sealed partial class StructureExecutionService : IStructureExecutionServi
         return tokens;
     }
 
+    private static Dictionary<string, int> ParseSlotMap(string? slotMapJson)
+    {
+        var map = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(slotMapJson)) return map;
+        try
+        {
+            using var doc = JsonDocument.Parse(slotMapJson);
+            var dict = doc.RootElement.TryGetProperty("slotToOrdinal", out var d)
+                ? d : doc.RootElement;
+            if (dict.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var p in dict.EnumerateObject())
+                {
+                    if (p.Value.ValueKind == JsonValueKind.Number
+                        && p.Value.TryGetInt32(out var n))
+                        map[p.Name] = n;
+                }
+            }
+        }
+        catch { /* tolerate malformed */ }
+        return map;
+    }
+
     private static string SubstituteTokens(string template, Dictionary<string, string> tokens)
     {
         if (string.IsNullOrEmpty(template)) return string.Empty;
         return TokenRegex().Replace(template, m =>
             tokens.TryGetValue(m.Groups[1].Value, out var v) ? v : "_");
-    }
-
-    private static string SafeForPath(string s)
-    {
-        var invalid = Path.GetInvalidFileNameChars();
-        var clean = new string(s.Where(c => !invalid.Contains(c)).ToArray()).Trim();
-        return string.IsNullOrWhiteSpace(clean) ? "_" : clean;
     }
 
     private static FileRelocationRecord SkipRecord(

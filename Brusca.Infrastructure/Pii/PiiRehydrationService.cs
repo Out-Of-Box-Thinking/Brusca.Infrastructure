@@ -11,18 +11,27 @@ namespace Brusca.Infrastructure.Pii;
 /// path strings, returning a fully materialized literal. PII is decrypted
 /// in-process via <see cref="IEncryptionService"/>; rehydrated values are
 /// never logged and never returned across an API boundary.
+///
+/// Phase 11: when a per-file <c>SlotMapJson</c> is available, named-slot
+/// placeholders (e.g. <c>{{ClientName}}</c>) are resolved by looking up the
+/// mapped <see cref="PiiSegment.Ordinal"/>. Kind-keyed placeholders
+/// (e.g. <c>{{PersonName}}</c>) remain available as a corpus-wide fallback
+/// pool when a slot is unmapped.
 /// </summary>
 public sealed class PiiRehydrationService : IPiiRehydrationService
 {
     private readonly IRedactedFileRepository _redactedRepo;
     private readonly IEncryptionService _crypto;
+    private readonly IPathSafetyService _paths;
 
     public PiiRehydrationService(
         IRedactedFileRepository redactedRepo,
-        IEncryptionService crypto)
+        IEncryptionService crypto,
+        IPathSafetyService paths)
     {
         _redactedRepo = redactedRepo;
         _crypto = crypto;
+        _paths = paths;
     }
 
     /// <inheritdoc />
@@ -53,7 +62,7 @@ public sealed class PiiRehydrationService : IPiiRehydrationService
         var allRes = await _redactedRepo.GetByCleaningIdAsync(cleaningId, ct);
         if (allRes.IsFailed) return Result.Fail(allRes.Errors);
 
-        // Build a kind-keyed lookup pool from every descriptor in the cleaning.
+        // Build a kind-keyed fallback pool from every descriptor in the cleaning.
         // Templates use {{Kind}} placeholders (e.g. {{PersonName}}, {{StreetAddress}}).
         var pool = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var descriptor in allRes.Value)
@@ -62,7 +71,7 @@ public sealed class PiiRehydrationService : IPiiRehydrationService
             {
                 var key = seg.Kind.ToString();
                 if (!pool.ContainsKey(key))
-                    pool[key] = SanitizeForPath(seg.Value);
+                    pool[key] = _paths.SanitizeSegment(seg.Value);
             }
         }
 
@@ -86,12 +95,5 @@ public sealed class PiiRehydrationService : IPiiRehydrationService
             // Corrupt or key-rotated payload — return empty rather than abort the run.
             return [];
         }
-    }
-
-    private static string SanitizeForPath(string value)
-    {
-        var invalid = Path.GetInvalidFileNameChars();
-        var clean = new string(value.Where(c => !invalid.Contains(c)).ToArray()).Trim();
-        return string.IsNullOrWhiteSpace(clean) ? "_" : clean;
     }
 }
