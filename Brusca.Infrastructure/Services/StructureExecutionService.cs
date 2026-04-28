@@ -31,6 +31,7 @@ public sealed partial class StructureExecutionService : IStructureExecutionServi
     private readonly IEncryptionService _crypto;
     private readonly IFileHashService _hash;
     private readonly IImageRedactionService? _imageRedactor;
+    private readonly IFileMetadataStripper? _metadataStripper;
     private readonly IDuplicateDetectionService _dupes;
     private readonly MaterializationOptions _materialization;
     private readonly IAuditLogger _audit;
@@ -48,7 +49,8 @@ public sealed partial class StructureExecutionService : IStructureExecutionServi
         IOptions<BruscaOptions> options,
         IAuditLogger audit,
         IErrorLogger log,
-        IImageRedactionService? imageRedactor = null)
+        IImageRedactionService? imageRedactor = null,
+        IFileMetadataStripper? metadataStripper = null)
     {
         _cleaningRepo    = cleaningRepo;
         _redactedRepo    = redactedRepo;
@@ -61,7 +63,8 @@ public sealed partial class StructureExecutionService : IStructureExecutionServi
         _materialization = options.Value.Materialization;
         _audit           = audit;
         _log             = log;
-        _imageRedactor   = imageRedactor;
+        _imageRedactor    = imageRedactor;
+        _metadataStripper = metadataStripper;
     }
 
     public async Task<Result<IReadOnlyList<FileRelocationRecord>>> ExecuteStructureAsync(
@@ -207,13 +210,63 @@ public sealed partial class StructureExecutionService : IStructureExecutionServi
 
                     // Always copy — the original at BeforePath remains untouched.
                     if (File.Exists(file.OriginalFilePath))
-                        File.Copy(file.OriginalFilePath, resolved, overwrite: false);
+                    {
+                        // Image branch: route through IImageRedactionService when
+                        // we have computed PII regions and a redactor is wired.
+                        var sanitized = false;
+                        if (_materialization.SanitizeImages
+                            && _imageRedactor is not null
+                            && _imageRedactor.CanRedact(file.Extension)
+                            && !string.IsNullOrEmpty(file.ImageRedactionRegionsJson))
+                        {
+                            try
+                            {
+                                var regions = JsonSerializer.Deserialize<List<ImageRedactionRegion>>(
+                                    file.ImageRedactionRegionsJson) ?? [];
+                                if (regions.Count > 0)
+                                {
+                                    var rr = await _imageRedactor.RedactAsync(
+                                        file.OriginalFilePath, resolved, regions, ct);
+                                    if (rr.IsSuccess)
+                                    {
+                                        sanitized = true;
+                                        if (!string.IsNullOrEmpty(rr.Value.SanitizedContentHash))
+                                            fileRec.ContentHashAfter = rr.Value.SanitizedContentHash;
+                                    }
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                await _log.LogErrorAsync(
+                                    $"Image redaction fell back to plain copy for {file.OriginalFilePath}",
+                                    ex, cleaningId: cleaningId);
+                            }
+                        }
+
+                        if (!sanitized)
+                            File.Copy(file.OriginalFilePath, resolved, overwrite: false);
+                    }
 
                     fileRec.Status = RelocationStatus.Succeeded;
                     fileRec.CompletedAtUtc = DateTime.UtcNow;
 
+                    // Strip identifying metadata from the materialized copy
+                    // (EXIF/XMP, OpenXml core props, PDF /Info ...). Best-effort.
+                    if (_materialization.StripMetadata
+                        && _metadataStripper is not null
+                        && File.Exists(resolved)
+                        && _metadataStripper.CanStrip(file.Extension))
+                    {
+                        try { await _metadataStripper.StripAsync(resolved, file.Extension, ct); }
+                        catch (Exception ex)
+                        {
+                            await _log.LogErrorAsync(
+                                $"Metadata strip failed for {resolved}", ex, cleaningId: cleaningId);
+                        }
+                    }
+
                     // Post-move integrity hash for audit; non-fatal on failure.
-                    if (File.Exists(resolved))
+                    if (string.IsNullOrEmpty(fileRec.ContentHashAfter) && File.Exists(resolved))
                     {
                         var hashRes = await _hash.ComputeAsync(resolved, ct);
                         if (hashRes.IsSuccess) fileRec.ContentHashAfter = hashRes.Value;

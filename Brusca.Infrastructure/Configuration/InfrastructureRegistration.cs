@@ -8,6 +8,8 @@ using Brusca.Infrastructure.Encryption;
 using Brusca.Infrastructure.Logging;
 using Brusca.Infrastructure.Pii;
 using Brusca.Infrastructure.Services;
+using Brusca.Infrastructure.Services.Metadata;
+using Brusca.Infrastructure.Services.Trash;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;

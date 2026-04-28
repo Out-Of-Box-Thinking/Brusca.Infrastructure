@@ -1,4 +1,3 @@
-using System.Runtime.Versioning;
 using Brusca.Core.Contracts.Logging;
 using Brusca.Core.Contracts.Repositories;
 using Brusca.Core.Contracts.Services;
@@ -9,21 +8,20 @@ using FluentResults;
 namespace Brusca.Infrastructure.Services;
 
 /// <summary>
-/// Hash-gated, recycle-bin-based finalisation step. Runs only on Windows
-/// because <see cref="Microsoft.VisualBasic.FileIO.FileSystem"/> requires the
-/// host to be running on Windows.
+/// Hash-gated, trash-based finalisation step. For every successfully-
+/// materialized relocation, verifies the post-move hash matches the original
+/// then sends the original to the OS trash via <see cref="ITrashService"/>
+/// (Windows recycle bin, Linux freedesktop trash, macOS Finder trash).
 ///
-/// For every successfully-materialized relocation, verifies the post-move
-/// hash matches the original then sends the original to the recycle bin.
-/// Originals remain untouched on hash mismatch — the operator can still
-/// recover them by hand because nothing has been deleted.
+/// Originals are NEVER permanently deleted — they remain recoverable from
+/// the system trash. On hash mismatch, originals are left untouched.
 /// </summary>
-[SupportedOSPlatform("windows")]
 public sealed class PromotionService : IPromotionService
 {
     private readonly IFileRelocationRepository _relocRepo;
     private readonly IRedactedFileRepository _redactedRepo;
     private readonly IPromotionRepository _promoRepo;
+    private readonly ITrashService _trash;
     private readonly IAuditLogger _audit;
     private readonly IErrorLogger _log;
 
@@ -31,12 +29,14 @@ public sealed class PromotionService : IPromotionService
         IFileRelocationRepository relocRepo,
         IRedactedFileRepository redactedRepo,
         IPromotionRepository promoRepo,
+        ITrashService trash,
         IAuditLogger audit,
         IErrorLogger log)
     {
         _relocRepo    = relocRepo;
         _redactedRepo = redactedRepo;
         _promoRepo    = promoRepo;
+        _trash        = trash;
         _audit        = audit;
         _log          = log;
     }
@@ -88,13 +88,9 @@ public sealed class PromotionService : IPromotionService
 
             try
             {
-                if (File.Exists(orig.OriginalFilePath))
-                {
-                    Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(
-                        orig.OriginalFilePath,
-                        Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs,
-                        Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
-                }
+                var trashRes = await _trash.MoveToTrashAsync(orig.OriginalFilePath, ct);
+                if (trashRes.IsFailed)
+                    throw new IOException(string.Join("; ", trashRes.Errors.Select(e => e.Message)));
                 rec.PromotedAtUtc = DateTime.UtcNow;
                 rec.Status        = PromotionStatus.Promoted;
             }

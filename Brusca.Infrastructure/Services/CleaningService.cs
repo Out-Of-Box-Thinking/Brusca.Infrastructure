@@ -12,7 +12,7 @@ using System.Text.Json;
 
 namespace Brusca.Infrastructure.Services;
 
-public sealed class CleaningService : ICleaningService
+public sealed partial class CleaningService : ICleaningService
 {
     private readonly ICleaningRepository _cleaningRepo;
     private readonly IPromptStepRepository _promptRepo;
@@ -26,6 +26,8 @@ public sealed class CleaningService : ICleaningService
     private readonly IPiiRedactionService _redactor;
     private readonly IDocumentTypeClassifier _classifier;
     private readonly IEncryptionService _crypto;
+    private readonly IOcrService _ocr;
+    private readonly IImageRedactionService? _imageRedactor;
     private readonly IClaudeStructureService _claudeStructure;
     private readonly IStructureExecutionService _structureExec;
     private readonly IDuplicateDetectionService _dupes;
@@ -47,13 +49,15 @@ public sealed class CleaningService : ICleaningService
         IPiiRedactionService redactor,
         IDocumentTypeClassifier classifier,
         IEncryptionService crypto,
+        IOcrService ocr,
         IClaudeStructureService claudeStructure,
         IStructureExecutionService structureExec,
         IDuplicateDetectionService dupes,
         ClaudePromptService claude,
         IAuditLogger audit,
         IErrorLogger log,
-        IPromotionService? promotion = null)
+        IPromotionService? promotion = null,
+        IImageRedactionService? imageRedactor = null)
     {
         _cleaningRepo    = cleaningRepo;
         _promptRepo      = promptRepo;
@@ -67,6 +71,8 @@ public sealed class CleaningService : ICleaningService
         _redactor        = redactor;
         _classifier      = classifier;
         _crypto          = crypto;
+        _ocr             = ocr;
+        _imageRedactor   = imageRedactor;
         _claudeStructure = claudeStructure;
         _structureExec   = structureExec;
         _dupes           = dupes;
@@ -320,7 +326,13 @@ public sealed class CleaningService : ICleaningService
                 var truncated = read.Value.Length > 500
                     ? read.Value[..500] + "..."
                     : read.Value;
-                samples.Add($"--- {Path.GetFileName(file)} ---\n{truncated}");
+
+                // Redact PII before the sample ever leaves the host —
+                // Claude must never see un-redacted file content.
+                var redacted = await _redactor.RedactAsync(truncated, ct);
+                var safe     = redacted.IsSuccess ? redacted.Value.RedactedContent : truncated;
+
+                samples.Add($"--- {Path.GetFileName(file)} ---\n{safe}");
                 count++;
             }
         }
@@ -358,10 +370,30 @@ public sealed class CleaningService : ICleaningService
             ct.ThrowIfCancellationRequested();
             var ext = Path.GetExtension(file).ToLowerInvariant();
 
-            var read = await _fs.ReadFileContentAsync(file, ct);
-            if (read.IsFailed) continue; // unreadable / too large — skip silently
+            // For image files, OCR with bounding boxes feeds redaction so we
+            // (a) catch PII text embedded in images and (b) record the pixel
+            // regions the image-redactor will later occlude on the copy.
+            string? content = null;
+            IReadOnlyList<OcrWord>? ocrWords = null;
 
-            var redactionResult = await _redactor.RedactAsync(read.Value, ct);
+            if (_imageRedactor is not null && _imageRedactor.CanRedact(ext))
+            {
+                var ocrRes = await _ocr.ExtractTextWithRegionsAsync(file, ct);
+                if (ocrRes.IsSuccess && !string.IsNullOrEmpty(ocrRes.Value.Text))
+                {
+                    content  = ocrRes.Value.Text;
+                    ocrWords = ocrRes.Value.Words;
+                }
+            }
+
+            if (content is null)
+            {
+                var read = await _fs.ReadFileContentAsync(file, ct);
+                if (read.IsFailed) continue; // unreadable / too large — skip silently
+                content = read.Value;
+            }
+
+            var redactionResult = await _redactor.RedactAsync(content, ct);
             if (redactionResult.IsFailed) continue;
 
             var classifyResult = await _classifier.ClassifyAsync(
@@ -375,17 +407,28 @@ public sealed class CleaningService : ICleaningService
                 sealedPii = _crypto.Encrypt(json);
             }
 
+            // For images, map redacted PII spans back onto OCR bounding
+            // boxes so the materialize step can occlude them.
+            string? regionsJson = null;
+            if (ocrWords is { Count: > 0 } && redactionResult.Value.Segments.Count > 0)
+            {
+                var regions = MapSegmentsToRegions(redactionResult.Value.Segments, ocrWords);
+                if (regions.Count > 0)
+                    regionsJson = JsonSerializer.Serialize(regions);
+            }
+
             var descriptor = new RedactedFileDescriptor
             {
-                CleaningId         = cleaningId,
-                OriginalFilePath   = file,
-                OriginalFileName   = Path.GetFileName(file),
-                Extension          = ext,
-                DocumentType       = classifyResult.IsSuccess ? classifyResult.Value : DocumentType.Unknown,
-                RedactedContent    = redactionResult.Value.RedactedContent,
-                EncryptedPiiJson   = sealedPii,
-                PiiSegmentCount    = redactionResult.Value.Segments.Count,
-                ContentHash        = RegexPiiRedactionService.Sha256Hex(read.Value)
+                CleaningId                = cleaningId,
+                OriginalFilePath          = file,
+                OriginalFileName          = Path.GetFileName(file),
+                Extension                 = ext,
+                DocumentType              = classifyResult.IsSuccess ? classifyResult.Value : DocumentType.Unknown,
+                RedactedContent           = redactionResult.Value.RedactedContent,
+                EncryptedPiiJson          = sealedPii,
+                PiiSegmentCount           = redactionResult.Value.Segments.Count,
+                ContentHash               = RegexPiiRedactionService.Sha256Hex(content),
+                ImageRedactionRegionsJson = regionsJson
             };
 
             await _redactedRepo.CreateAsync(descriptor, ct);
@@ -518,4 +561,39 @@ internal static class CleaningExtensions
 {
     internal static bool IsCompleted(this Cleaning c) =>
         c.Status == CleaningStatus.Completed;
+}
+
+// ── Span → image-region mapping ─────────────────────────────────────────────
+public sealed partial class CleaningService
+{
+    /// <summary>
+    /// Maps redacted PII character spans (start/length inside the OCR'd text)
+    /// back onto OCR word bounding boxes. A word is included whenever its
+    /// character range overlaps the segment's range.
+    /// </summary>
+    private static IReadOnlyList<ImageRedactionRegion> MapSegmentsToRegions(
+        IEnumerable<PiiSegment> segments, IReadOnlyList<OcrWord> words)
+    {
+        var regions = new List<ImageRedactionRegion>();
+        foreach (var s in segments)
+        {
+            int sStart = s.StartIndex, sEnd = s.StartIndex + s.Length;
+            foreach (var w in words)
+            {
+                int wStart = w.TextOffset, wEnd = w.TextOffset + w.Text.Length;
+                if (wEnd > sStart && wStart < sEnd)
+                {
+                    regions.Add(new ImageRedactionRegion
+                    {
+                        X      = w.X,
+                        Y      = w.Y,
+                        Width  = w.Width,
+                        Height = w.Height,
+                        Label  = s.Kind.ToString()
+                    });
+                }
+            }
+        }
+        return regions;
+    }
 }

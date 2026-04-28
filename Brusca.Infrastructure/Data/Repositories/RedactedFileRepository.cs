@@ -34,6 +34,7 @@ public sealed class RedactedFileRepository : DapperRepositoryBase, IRedactedFile
                 descriptor.EncryptedPiiJson,
                 descriptor.PiiSegmentCount,
                 descriptor.ContentHash,
+                descriptor.ImageRedactionRegionsJson,
                 descriptor.DiscoveredAtUtc
             }, ct);
             return Result.Ok(descriptor);
