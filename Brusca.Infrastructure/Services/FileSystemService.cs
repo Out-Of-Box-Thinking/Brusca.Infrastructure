@@ -29,16 +29,16 @@ public sealed class FileSystemService : IFileSystemService
         try
         {
             var extensions = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            int totalFiles = 0, totalDirs = 0;
+            var counters = new ScanCounters();
 
-            await WalkAsync(rootPath, 0, extensions, ref totalFiles, ref totalDirs, ct);
+            await WalkAsync(rootPath, 0, extensions, counters, ct);
 
             return Result.Ok(new ExtensionScanResult
             {
                 CleaningId = cleaningId,
                 AllExtensions = extensions.Keys.OrderBy(e => e).ToList(),
-                TotalFileCount = totalFiles,
-                TotalDirectoryCount = totalDirs
+                TotalFileCount = counters.Files,
+                TotalDirectoryCount = counters.Directories
             });
         }
         catch (Exception ex)
@@ -125,7 +125,7 @@ public sealed class FileSystemService : IFileSystemService
     private async Task WalkAsync(
         string dir, int depth,
         Dictionary<string, int> extensions,
-        ref int totalFiles, ref int totalDirs,
+        ScanCounters counters,
         CancellationToken ct)
     {
         if (depth > _opts.MaxDepth || ct.IsCancellationRequested) return;
@@ -133,18 +133,24 @@ public sealed class FileSystemService : IFileSystemService
         var dirName = Path.GetFileName(dir);
         if (_opts.IgnoredDirectories.Contains(dirName, StringComparer.OrdinalIgnoreCase)) return;
 
-        totalDirs++;
+        counters.Directories++;
 
         foreach (var file in Directory.EnumerateFiles(dir))
         {
-            totalFiles++;
+            counters.Files++;
             var ext = Path.GetExtension(file).ToLowerInvariant();
             if (!string.IsNullOrEmpty(ext))
                 extensions[ext] = extensions.GetValueOrDefault(ext) + 1;
         }
 
         foreach (var sub in Directory.EnumerateDirectories(dir))
-            await WalkAsync(sub, depth + 1, extensions, ref totalFiles, ref totalDirs, ct);
+            await WalkAsync(sub, depth + 1, extensions, counters, ct);
+    }
+
+    private sealed class ScanCounters
+    {
+        public int Files;
+        public int Directories;
     }
 
     private DirectoryNode BuildNode(string path, int depth)

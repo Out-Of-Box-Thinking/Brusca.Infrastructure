@@ -4,8 +4,11 @@ using Brusca.Core.Contracts.Services;
 using Brusca.Core.Models;
 using Brusca.Infrastructure.Claude;
 using Brusca.Infrastructure.Data.Repositories;
+using Brusca.Infrastructure.Encryption;
 using Brusca.Infrastructure.Logging;
+using Brusca.Infrastructure.Pii;
 using Brusca.Infrastructure.Services;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -24,15 +27,30 @@ public static class InfrastructureRegistration
         services.AddScoped<IFileExtensionRepository, FileExtensionRepository>();
         services.AddScoped<IPromptStepRepository, PromptStepRepository>();
         services.AddScoped<IPromptStepCommandRepository, PromptStepCommandRepository>();
+        services.AddScoped<IRedactedFileRepository, RedactedFileRepository>();
+        services.AddScoped<IStructurePlanRepository, StructurePlanRepository>();
+        services.AddScoped<IFileRelocationRepository, FileRelocationRepository>();
 
         // Services
         services.AddScoped<ICleaningService, CleaningService>();
         services.AddScoped<IFileSystemService, FileSystemService>();
         services.AddScoped<IFileExtensionService, FileExtensionService>();
         services.AddScoped<ITreeProjectionService, TreeProjectionService>();
+        services.AddScoped<IPiiRedactionService, RegexPiiRedactionService>();
+        services.AddScoped<IDocumentTypeClassifier, HeuristicDocumentTypeClassifier>();
+        services.AddScoped<IStructureExecutionService, StructureExecutionService>();
+
+        // Encryption — ASP.NET Core Data Protection seals the PII JSON column.
+        var pii = configuration.GetSection("Brusca:Pii").Get<PiiOptions>() ?? new PiiOptions();
+        var dpBuilder = services.AddDataProtection()
+            .SetApplicationName(pii.DataProtectionApplicationName);
+        if (!string.IsNullOrWhiteSpace(pii.KeyRingDirectory))
+            dpBuilder.PersistKeysToFileSystem(new DirectoryInfo(pii.KeyRingDirectory));
+        services.AddSingleton<IEncryptionService, DataProtectionEncryptionService>();
 
         // Claude
         services.AddSingleton<ClaudePromptService>();
+        services.AddSingleton<IClaudeStructureService, ClaudeStructureService>();
 
         // Logging
         services.AddSingleton<IErrorLogger, SerilogErrorLogger>();

@@ -50,10 +50,10 @@ public sealed class ClaudePromptService
         {
             Model = _opts.Model,
             MaxTokens = _opts.MaxTokens,
-            System = systemPrompt,
-            Messages = [new Message { Role = RoleType.User, Content = userPrompt }]
+            SystemMessage = systemPrompt,
+            Messages = [new Message { Role = RoleType.User, Content = new List<ContentBase> { new TextContent { Text = userPrompt } } }]
         };
-        var response = await _client.Messages.GetClaudeMessageAsync(request, ct);
+        var response = await _client.Messages.GetClaudeMessageAsync(request, null, ct);
         return response.Content.OfType<TextContent>().FirstOrDefault()?.Text ?? string.Empty;
     }
 

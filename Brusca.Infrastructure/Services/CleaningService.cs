@@ -4,7 +4,9 @@ using Brusca.Core.Contracts.Services;
 using Brusca.Core.Enums;
 using Brusca.Core.Models.Cleaning;
 using Brusca.Core.Models.Extensions;
+using Brusca.Core.Models.Pii;
 using Brusca.Infrastructure.Claude;
+using Brusca.Infrastructure.Pii;
 using FluentResults;
 using System.Text.Json;
 
@@ -15,9 +17,17 @@ public sealed class CleaningService : ICleaningService
     private readonly ICleaningRepository _cleaningRepo;
     private readonly IPromptStepRepository _promptRepo;
     private readonly IPromptStepCommandRepository _cmdRepo;
+    private readonly IRedactedFileRepository _redactedRepo;
+    private readonly IStructurePlanRepository _planRepo;
+    private readonly IFileRelocationRepository _relocRepo;
     private readonly IFileSystemService _fs;
     private readonly IFileExtensionService _extService;
     private readonly ITreeProjectionService _projection;
+    private readonly IPiiRedactionService _redactor;
+    private readonly IDocumentTypeClassifier _classifier;
+    private readonly IEncryptionService _crypto;
+    private readonly IClaudeStructureService _claudeStructure;
+    private readonly IStructureExecutionService _structureExec;
     private readonly ClaudePromptService _claude;
     private readonly IAuditLogger _audit;
     private readonly IErrorLogger _log;
@@ -26,22 +36,38 @@ public sealed class CleaningService : ICleaningService
         ICleaningRepository cleaningRepo,
         IPromptStepRepository promptRepo,
         IPromptStepCommandRepository cmdRepo,
+        IRedactedFileRepository redactedRepo,
+        IStructurePlanRepository planRepo,
+        IFileRelocationRepository relocRepo,
         IFileSystemService fs,
         IFileExtensionService extService,
         ITreeProjectionService projection,
+        IPiiRedactionService redactor,
+        IDocumentTypeClassifier classifier,
+        IEncryptionService crypto,
+        IClaudeStructureService claudeStructure,
+        IStructureExecutionService structureExec,
         ClaudePromptService claude,
         IAuditLogger audit,
         IErrorLogger log)
     {
-        _cleaningRepo = cleaningRepo;
-        _promptRepo   = promptRepo;
-        _cmdRepo      = cmdRepo;
-        _fs           = fs;
-        _extService   = extService;
-        _projection   = projection;
-        _claude       = claude;
-        _audit        = audit;
-        _log          = log;
+        _cleaningRepo    = cleaningRepo;
+        _promptRepo      = promptRepo;
+        _cmdRepo         = cmdRepo;
+        _redactedRepo    = redactedRepo;
+        _planRepo        = planRepo;
+        _relocRepo       = relocRepo;
+        _fs              = fs;
+        _extService      = extService;
+        _projection      = projection;
+        _redactor        = redactor;
+        _classifier      = classifier;
+        _crypto          = crypto;
+        _claudeStructure = claudeStructure;
+        _structureExec   = structureExec;
+        _claude          = claude;
+        _audit           = audit;
+        _log             = log;
     }
 
     public async Task<Result<Cleaning>> StartCleaningAsync(
@@ -304,6 +330,106 @@ public sealed class CleaningService : ICleaningService
         return path.Replace(originalRoot, executionRoot,
             StringComparison.OrdinalIgnoreCase);
     }
+
+    // ── PII redaction + structure-plan pipeline ──────────────────────────────
+
+    public async Task<Result<IReadOnlyList<RedactedFileDescriptor>>> RedactAndClassifyAsync(
+        Guid cleaningId, CancellationToken ct = default)
+    {
+        var cleaningResult = await _cleaningRepo.GetByIdAsync(cleaningId, ct);
+        if (cleaningResult.IsFailed) return Result.Fail(cleaningResult.Errors);
+        var cleaning = cleaningResult.Value;
+
+        await _cleaningRepo.UpdateStatusAsync(cleaningId, CleaningStatus.Redacting, ct);
+        // Wipe any prior redaction artefacts for this cleaning.
+        await _redactedRepo.DeleteByCleaningIdAsync(cleaningId, ct);
+
+        var descriptors = new List<RedactedFileDescriptor>();
+
+        foreach (var file in Directory.EnumerateFiles(
+            cleaning.RootPath, "*", SearchOption.AllDirectories))
+        {
+            ct.ThrowIfCancellationRequested();
+            var ext = Path.GetExtension(file).ToLowerInvariant();
+
+            var read = await _fs.ReadFileContentAsync(file, ct);
+            if (read.IsFailed) continue; // unreadable / too large — skip silently
+
+            var redactionResult = await _redactor.RedactAsync(read.Value, ct);
+            if (redactionResult.IsFailed) continue;
+
+            var classifyResult = await _classifier.ClassifyAsync(
+                redactionResult.Value.RedactedContent, ext, ct);
+
+            // Encrypt the PII segments before they ever land at rest
+            string? sealedPii = null;
+            if (redactionResult.Value.Segments.Count > 0)
+            {
+                var json = JsonSerializer.Serialize(redactionResult.Value.Segments);
+                sealedPii = _crypto.Encrypt(json);
+            }
+
+            var descriptor = new RedactedFileDescriptor
+            {
+                CleaningId         = cleaningId,
+                OriginalFilePath   = file,
+                OriginalFileName   = Path.GetFileName(file),
+                Extension          = ext,
+                DocumentType       = classifyResult.IsSuccess ? classifyResult.Value : DocumentType.Unknown,
+                RedactedContent    = redactionResult.Value.RedactedContent,
+                EncryptedPiiJson   = sealedPii,
+                PiiSegmentCount    = redactionResult.Value.Segments.Count,
+                ContentHash        = RegexPiiRedactionService.Sha256Hex(read.Value)
+            };
+
+            await _redactedRepo.CreateAsync(descriptor, ct);
+            descriptors.Add(descriptor);
+        }
+
+        await _cleaningRepo.UpdateStatusAsync(cleaningId, CleaningStatus.Redacted, ct);
+        await _audit.LogAsync("CleaningRedacted", "Cleaning",
+            cleaningId.ToString(), action: "RedactAndClassify",
+            newValues: new { Count = descriptors.Count });
+
+        return Result.Ok<IReadOnlyList<RedactedFileDescriptor>>(descriptors);
+    }
+
+    public async Task<Result<DirectoryStructurePlan>> GenerateStructurePlanAsync(
+        Guid cleaningId, CancellationToken ct = default)
+    {
+        var summariesResult = await _redactedRepo.GetDocumentTypeSummariesAsync(cleaningId, ct);
+        if (summariesResult.IsFailed) return Result.Fail(summariesResult.Errors);
+
+        if (summariesResult.Value.Count == 0)
+            return Result.Fail("No redacted descriptors exist — run RedactAndClassify first.");
+
+        var plan = await _claudeStructure.AnalyzeStructureAsync(
+            cleaningId, summariesResult.Value, ct);
+
+        // Replace any prior plan
+        await _planRepo.DeleteByCleaningIdAsync(cleaningId, ct);
+        var saved = await _planRepo.CreateAsync(plan, ct);
+        if (saved.IsFailed) return saved;
+
+        await _cleaningRepo.UpdateStatusAsync(cleaningId, CleaningStatus.StructurePlanGenerated, ct);
+        await _audit.LogAsync("StructurePlanGenerated", "Cleaning",
+            cleaningId.ToString(), action: "GenerateStructure",
+            newValues: new { Rules = plan.Rules.Count });
+
+        return Result.Ok(plan);
+    }
+
+    public Task<Result<DirectoryStructurePlan>> GetStructurePlanAsync(
+        Guid cleaningId, CancellationToken ct = default)
+        => _planRepo.GetLatestAsync(cleaningId, ct);
+
+    public Task<Result<IReadOnlyList<FileRelocationRecord>>> ExecuteStructurePlanAsync(
+        Guid cleaningId, CancellationToken ct = default)
+        => _structureExec.ExecuteStructureAsync(cleaningId, ct);
+
+    public Task<Result<IReadOnlyList<FileRelocationRecord>>> GetRelocationsAsync(
+        Guid cleaningId, CancellationToken ct = default)
+        => _relocRepo.GetByCleaningIdAsync(cleaningId, ct);
 }
 
 // ── Extension helpers ────────────────────────────────────────────────────────

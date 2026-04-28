@@ -16,7 +16,7 @@
 
   <ItemGroup>
     <!-- Core domain — consumed as a NuGet package from the shared local feed during development -->
-    <PackageReference Include="Brusca.Core" Version="1.0.*" />
+    <PackageReference Include="Brusca.Core" Version="1.0.999-pii" />
   </ItemGroup>
 
   <ItemGroup>

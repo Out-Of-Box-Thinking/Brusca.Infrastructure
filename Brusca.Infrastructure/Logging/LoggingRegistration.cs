@@ -92,21 +92,19 @@ public static class LoggingRegistration
         {
             case LogSinkTarget.Database:
             case LogSinkTarget.Both:
-                Configuration.DataProvider = new SqlDataProvider(cfg =>
-                {
-                    cfg.ConnectionString = connStr;
-                    cfg.Schema = "audit";
-                    cfg.TableName = "Log";
-                    cfg.IdColumnName = "Id";
-                    cfg.JsonColumnName = "Data";
-                });
+                Audit.Core.Configuration.Setup()
+                    .UseSqlServer(cfg => cfg
+                        .ConnectionString(connStr)
+                        .Schema("audit")
+                        .TableName("Log")
+                        .IdColumnName("Id")
+                        .JsonColumnName("Data"));
                 break;
             case LogSinkTarget.File:
-                Configuration.DataProvider = new Audit.Core.Providers.FileDataProvider(cfg =>
-                {
-                    cfg.DirectoryPath = opts.FilePath ?? "logs/audit";
-                    cfg.FilenameBuilder = ev => $"{ev.EventType}_{ev.StartDate:yyyyMMdd_HHmmss}.json";
-                });
+                Audit.Core.Configuration.Setup()
+                    .UseFileLogProvider(cfg => cfg
+                        .Directory(opts.FilePath ?? "logs/audit")
+                        .FilenameBuilder(ev => $"{ev.EventType}_{ev.StartDate:yyyyMMdd_HHmmss}.json"));
                 break;
         }
     }

@@ -23,7 +23,7 @@ public sealed class FileExtensionRepository : DapperRepositoryBase, IFileExtensi
         try
         {
             var results = await QueryAsync<FileExtensionRecord>("fileext.usp_FileExtension_GetAll", ct: ct);
-            return r.Ok<IReadOnlyList<FileExtensionRecord>>(results.ToList());
+            return Result.Ok<IReadOnlyList<FileExtensionRecord>>(results.ToList());
         }
         catch (Exception ex)
         {
