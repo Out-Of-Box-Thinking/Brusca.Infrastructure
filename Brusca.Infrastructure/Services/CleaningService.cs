@@ -430,6 +430,33 @@ public sealed class CleaningService : ICleaningService
     public Task<Result<IReadOnlyList<FileRelocationRecord>>> GetRelocationsAsync(
         Guid cleaningId, CancellationToken ct = default)
         => _relocRepo.GetByCleaningIdAsync(cleaningId, ct);
+
+    public async Task<Result<IReadOnlyList<FileRelocationRecord>>> RollbackStructurePlanAsync(
+        Guid cleaningId, string userId, CancellationToken ct = default)
+    {
+        var result = await _structureExec.RollbackAsync(cleaningId, ct);
+        if (result.IsSuccess)
+        {
+            await _audit.LogAsync("StructureRollbackRequested", "Cleaning",
+                cleaningId.ToString(), userId: userId, action: "RollbackStructure",
+                newValues: new { Total = result.Value.Count });
+        }
+        return result;
+    }
+
+    public Task<Result<Cleaning?>> GetActiveCleaningAsync(CancellationToken ct = default)
+        => _cleaningRepo.GetActiveAsync(ct);
+
+    public async Task<Result> ArchiveCleaningAsync(
+        Guid cleaningId, string userId, CancellationToken ct = default)
+    {
+        var archive = await _cleaningRepo.ArchiveAsync(cleaningId, ct);
+        if (archive.IsFailed) return archive;
+
+        await _audit.LogAsync("CleaningArchived", "Cleaning",
+            cleaningId.ToString(), userId: userId, action: "Archive");
+        return Result.Ok();
+    }
 }
 
 // ── Extension helpers ────────────────────────────────────────────────────────

@@ -27,6 +27,8 @@ public sealed partial class StructureExecutionService : IStructureExecutionServi
     private readonly IFileRelocationRepository _relocRepo;
     private readonly IFileSystemService _fs;
     private readonly IEncryptionService _crypto;
+    private readonly IFileHashService _hash;
+    private readonly IImageRedactionService? _imageRedactor;
     private readonly IAuditLogger _audit;
     private readonly IErrorLogger _log;
 
@@ -37,17 +39,21 @@ public sealed partial class StructureExecutionService : IStructureExecutionServi
         IFileRelocationRepository relocRepo,
         IFileSystemService fs,
         IEncryptionService crypto,
+        IFileHashService hash,
         IAuditLogger audit,
-        IErrorLogger log)
+        IErrorLogger log,
+        IImageRedactionService? imageRedactor = null)
     {
-        _cleaningRepo = cleaningRepo;
-        _redactedRepo = redactedRepo;
-        _planRepo     = planRepo;
-        _relocRepo    = relocRepo;
-        _fs           = fs;
-        _crypto       = crypto;
-        _audit        = audit;
-        _log          = log;
+        _cleaningRepo  = cleaningRepo;
+        _redactedRepo  = redactedRepo;
+        _planRepo      = planRepo;
+        _relocRepo     = relocRepo;
+        _fs            = fs;
+        _crypto        = crypto;
+        _hash          = hash;
+        _audit         = audit;
+        _log           = log;
+        _imageRedactor = imageRedactor;
     }
 
     public async Task<Result<IReadOnlyList<FileRelocationRecord>>> ExecuteStructureAsync(
@@ -159,6 +165,13 @@ public sealed partial class StructureExecutionService : IStructureExecutionServi
                 }
                 fileRec.Status = RelocationStatus.Succeeded;
                 fileRec.CompletedAtUtc = DateTime.UtcNow;
+
+                // Post-move integrity hash for audit; non-fatal on failure.
+                if (File.Exists(newPath))
+                {
+                    var hashRes = await _hash.ComputeAsync(newPath, ct);
+                    if (hashRes.IsSuccess) fileRec.ContentHashAfter = hashRes.Value;
+                }
             }
             catch (Exception ex)
             {
@@ -178,6 +191,93 @@ public sealed partial class StructureExecutionService : IStructureExecutionServi
             newValues: new { Total = relocations.Count });
 
         return Result.Ok<IReadOnlyList<FileRelocationRecord>>(relocations);
+    }
+
+    public async Task<Result<IReadOnlyList<FileRelocationRecord>>> RollbackAsync(
+        Guid cleaningId, CancellationToken ct = default)
+    {
+        var allRes = await _relocRepo.GetByCleaningIdAsync(cleaningId, ct);
+        if (allRes.IsFailed) return Result.Fail(allRes.Errors);
+
+        // Reverse in newest-first order so directories created last are emptied first.
+        var ordered = allRes.Value
+            .Where(r => r.Status == RelocationStatus.Succeeded)
+            .OrderByDescending(r => r.CompletedAtUtc ?? r.CreatedAtUtc)
+            .ToList();
+
+        var processed = new List<FileRelocationRecord>(ordered.Count);
+
+        foreach (var rec in ordered)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                switch (rec.OperationType)
+                {
+                    case RelocationOperationType.Move:
+                        if (!string.IsNullOrEmpty(rec.AfterPath) &&
+                            !string.IsNullOrEmpty(rec.BeforePath) &&
+                            File.Exists(rec.AfterPath))
+                        {
+                            var srcDir = Path.GetDirectoryName(rec.BeforePath);
+                            if (!string.IsNullOrEmpty(srcDir)) Directory.CreateDirectory(srcDir);
+                            File.Move(rec.AfterPath, rec.BeforePath, overwrite: false);
+                        }
+                        break;
+
+                    case RelocationOperationType.Materialize:
+                    case RelocationOperationType.Copy:
+                        // Original was preserved; deleting the materialized copy is sufficient.
+                        if (!string.IsNullOrEmpty(rec.AfterPath) && File.Exists(rec.AfterPath))
+                            File.Delete(rec.AfterPath);
+                        break;
+
+                    case RelocationOperationType.CreateDirectory:
+                        // Best-effort: only remove if empty so we never destroy user data.
+                        if (!string.IsNullOrEmpty(rec.AfterPath) &&
+                            Directory.Exists(rec.AfterPath) &&
+                            !Directory.EnumerateFileSystemEntries(rec.AfterPath).Any())
+                        {
+                            Directory.Delete(rec.AfterPath);
+                        }
+                        break;
+
+                    case RelocationOperationType.Rename:
+                        if (!string.IsNullOrEmpty(rec.AfterPath) &&
+                            !string.IsNullOrEmpty(rec.BeforePath) &&
+                            File.Exists(rec.AfterPath))
+                        {
+                            File.Move(rec.AfterPath, rec.BeforePath, overwrite: false);
+                        }
+                        break;
+                }
+
+                rec.Status = RelocationStatus.RolledBack;
+                rec.CompletedAtUtc = DateTime.UtcNow;
+                await _relocRepo.UpdateStatusAsync(rec.Id, RelocationStatus.RolledBack, null, ct);
+            }
+            catch (Exception ex)
+            {
+                rec.Status = RelocationStatus.Failed;
+                rec.ErrorMessage = $"Rollback failed: {ex.Message}";
+                await _relocRepo.UpdateStatusAsync(rec.Id, RelocationStatus.Failed, rec.ErrorMessage, ct);
+                await _log.LogErrorAsync(
+                    $"Rollback failed for relocation {rec.Id}",
+                    ex, cleaningId: cleaningId);
+            }
+            processed.Add(rec);
+        }
+
+        await _audit.LogAsync("StructureRollback", "Cleaning",
+            cleaningId.ToString(), action: "RollbackStructure",
+            newValues: new
+            {
+                Total = processed.Count,
+                Succeeded = processed.Count(r => r.Status == RelocationStatus.RolledBack),
+                Failed = processed.Count(r => r.Status == RelocationStatus.Failed)
+            });
+
+        return Result.Ok<IReadOnlyList<FileRelocationRecord>>(processed);
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────

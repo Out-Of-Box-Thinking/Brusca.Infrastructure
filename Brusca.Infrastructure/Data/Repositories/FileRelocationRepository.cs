@@ -32,7 +32,8 @@ public sealed class FileRelocationRepository : DapperRepositoryBase, IFileReloca
                 Status          = (int)record.Status,
                 record.ErrorMessage,
                 record.CreatedAtUtc,
-                record.CompletedAtUtc
+                record.CompletedAtUtc,
+                record.ContentHashAfter
             }, ct);
             return Result.Ok(record);
         }

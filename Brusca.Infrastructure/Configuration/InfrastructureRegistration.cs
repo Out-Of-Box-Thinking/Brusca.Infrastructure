@@ -37,8 +37,15 @@ public static class InfrastructureRegistration
         services.AddScoped<IFileExtensionService, FileExtensionService>();
         services.AddScoped<ITreeProjectionService, TreeProjectionService>();
         services.AddScoped<IPiiRedactionService, RegexPiiRedactionService>();
+        services.AddScoped<IPiiRehydrationService, PiiRehydrationService>();
         services.AddScoped<IDocumentTypeClassifier, HeuristicDocumentTypeClassifier>();
         services.AddScoped<IStructureExecutionService, StructureExecutionService>();
+        services.AddSingleton<IFileHashService, Sha256FileHashService>();
+
+        // Image redaction is Windows-only (GDI+). Register only on Windows so
+        // non-Windows hosts can substitute their own IImageRedactionService.
+        if (OperatingSystem.IsWindows())
+            services.AddSingleton<IImageRedactionService, GdiImageRedactionService>();
 
         // Encryption — ASP.NET Core Data Protection seals the PII JSON column.
         var pii = configuration.GetSection("Brusca:Pii").Get<PiiOptions>() ?? new PiiOptions();

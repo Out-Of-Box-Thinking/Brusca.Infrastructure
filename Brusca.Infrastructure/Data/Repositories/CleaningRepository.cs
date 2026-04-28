@@ -133,4 +133,55 @@ public sealed class CleaningRepository : DapperRepositoryBase, ICleaningReposito
         }
         catch (Exception ex) { return Result.Fail(new ExceptionalError(ex)); }
     }
+
+    /// <inheritdoc />
+    public async Task<Result<Cleaning?>> GetActiveAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            var result = await QuerySingleOrDefaultAsync<Cleaning>(
+                "cleaning.usp_Cleaning_GetActive", new { }, ct);
+            return Result.Ok(result);
+        }
+        catch (Exception ex) { return Result.Fail(new ExceptionalError(ex)); }
+    }
+
+    /// <inheritdoc />
+    public async Task<Result> ArchiveAsync(Guid id, CancellationToken ct = default)
+    {
+        try
+        {
+            await ExecuteAsync("cleaning.usp_Cleaning_Archive",
+                new { Id = id, ArchivedAtUtc = DateTime.UtcNow }, ct);
+            return Result.Ok();
+        }
+        catch (Exception ex) { return Result.Fail(new ExceptionalError(ex)); }
+    }
+
+    /// <inheritdoc />
+    public async Task<Result<Cleaning>> GetArchivedByIdAsync(Guid id, CancellationToken ct = default)
+    {
+        try
+        {
+            var result = await QuerySingleOrDefaultAsync<Cleaning>(
+                "archive.usp_Cleaning_GetById", new { Id = id }, ct);
+            return result is not null
+                ? Result.Ok(result)
+                : Result.Fail($"Archived cleaning {id} not found.");
+        }
+        catch (Exception ex) { return Result.Fail(new ExceptionalError(ex)); }
+    }
+
+    /// <inheritdoc />
+    public async Task<Result<IReadOnlyList<Cleaning>>> GetArchivedPagedAsync(
+        int page, int pageSize, CancellationToken ct = default)
+    {
+        try
+        {
+            var rows = await QueryAsync<Cleaning>("archive.usp_Cleaning_GetPaged",
+                new { Page = page, PageSize = pageSize }, ct);
+            return Result.Ok<IReadOnlyList<Cleaning>>(rows.ToList());
+        }
+        catch (Exception ex) { return Result.Fail(new ExceptionalError(ex)); }
+    }
 }
