@@ -84,4 +84,40 @@ public sealed class FileRelocationRepository : DapperRepositoryBase, IFileReloca
         }
         catch (Exception ex) { return Result.Fail(new ExceptionalError(ex)); }
     }
+
+    public async Task<Result<FileRelocationRecord>> GetByIdAsync(
+        Guid id, CancellationToken ct = default)
+    {
+        try
+        {
+            var row = await QuerySingleOrDefaultAsync<FileRelocationRecord>(
+                "cleaning.usp_FileRelocation_GetById", new { Id = id }, ct);
+            return row is not null
+                ? Result.Ok(row)
+                : Result.Fail($"FileRelocation {id} not found.");
+        }
+        catch (Exception ex) { return Result.Fail(new ExceptionalError(ex)); }
+    }
+
+    public async Task<Result> UpdateAfterAsync(
+        Guid id, string? afterPath, string? afterName,
+        RelocationStatus status, string? error, string? contentHashAfter,
+        CancellationToken ct = default)
+    {
+        try
+        {
+            await ExecuteAsync("cleaning.usp_FileRelocation_UpdateAfter", new
+            {
+                Id = id,
+                AfterPath = afterPath,
+                AfterName = afterName,
+                Status = (int)status,
+                ErrorMessage = error,
+                ContentHashAfter = contentHashAfter,
+                CompletedAtUtc = DateTime.UtcNow
+            }, ct);
+            return Result.Ok();
+        }
+        catch (Exception ex) { return Result.Fail(new ExceptionalError(ex)); }
+    }
 }

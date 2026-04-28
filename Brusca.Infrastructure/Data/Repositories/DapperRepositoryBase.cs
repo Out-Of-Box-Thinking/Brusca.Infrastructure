@@ -67,4 +67,11 @@ public abstract class DapperRepositoryBase
             parameters,
             commandType: System.Data.CommandType.StoredProcedure);
     }
+
+    /// <summary>
+    /// Opens a SqlConnection bound to the configured connection string.
+    /// Caller is responsible for disposing it. Used by repositories that need
+    /// multi-result-set reads via <see cref="SqlMapper.QueryMultipleAsync"/>.
+    /// </summary>
+    protected SqlConnection OpenConnection() => new(_connectionString);
 }

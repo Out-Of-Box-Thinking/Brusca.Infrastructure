@@ -4,9 +4,11 @@ using Brusca.Core.Contracts.Logging;
 using Brusca.Core.Contracts.Repositories;
 using Brusca.Core.Contracts.Services;
 using Brusca.Core.Enums;
+using Brusca.Core.Models;
 using Brusca.Core.Models.Cleaning;
 using Brusca.Core.Models.Pii;
 using FluentResults;
+using Microsoft.Extensions.Options;
 
 namespace Brusca.Infrastructure.Services;
 
@@ -29,6 +31,8 @@ public sealed partial class StructureExecutionService : IStructureExecutionServi
     private readonly IEncryptionService _crypto;
     private readonly IFileHashService _hash;
     private readonly IImageRedactionService? _imageRedactor;
+    private readonly IDuplicateDetectionService _dupes;
+    private readonly MaterializationOptions _materialization;
     private readonly IAuditLogger _audit;
     private readonly IErrorLogger _log;
 
@@ -40,20 +44,24 @@ public sealed partial class StructureExecutionService : IStructureExecutionServi
         IFileSystemService fs,
         IEncryptionService crypto,
         IFileHashService hash,
+        IDuplicateDetectionService dupes,
+        IOptions<BruscaOptions> options,
         IAuditLogger audit,
         IErrorLogger log,
         IImageRedactionService? imageRedactor = null)
     {
-        _cleaningRepo  = cleaningRepo;
-        _redactedRepo  = redactedRepo;
-        _planRepo      = planRepo;
-        _relocRepo     = relocRepo;
-        _fs            = fs;
-        _crypto        = crypto;
-        _hash          = hash;
-        _audit         = audit;
-        _log           = log;
-        _imageRedactor = imageRedactor;
+        _cleaningRepo    = cleaningRepo;
+        _redactedRepo    = redactedRepo;
+        _planRepo        = planRepo;
+        _relocRepo       = relocRepo;
+        _fs              = fs;
+        _crypto          = crypto;
+        _hash            = hash;
+        _dupes           = dupes;
+        _materialization = options.Value.Materialization;
+        _audit           = audit;
+        _log             = log;
+        _imageRedactor   = imageRedactor;
     }
 
     public async Task<Result<IReadOnlyList<FileRelocationRecord>>> ExecuteStructureAsync(
@@ -82,9 +90,36 @@ public sealed partial class StructureExecutionService : IStructureExecutionServi
         var relocations = new List<FileRelocationRecord>();
         var createdDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+        // Dedupe: which redacted-file ids should be skipped because they are
+        // non-keeper members of a duplicate group?
+        var (nonKeepers, keeperPathById) = await ResolveDuplicatesAsync(cleaningId, files, ct);
+
         foreach (var file in files)
         {
             ct.ThrowIfCancellationRequested();
+
+            // Duplicate skip — record an audit row and move on.
+            if (nonKeepers.TryGetValue(file.Id, out var keeperId))
+            {
+                var keeperPath = keeperPathById.TryGetValue(keeperId, out var p) ? p : "(unknown)";
+                var dupRec = new FileRelocationRecord
+                {
+                    CleaningId      = cleaningId,
+                    RedactedFileId  = file.Id,
+                    OperationType   = RelocationOperationType.SkipDuplicate,
+                    ExecutionTarget = cleaning.ExecutionTarget,
+                    BeforePath      = file.OriginalFilePath,
+                    BeforeName      = file.OriginalFileName,
+                    AfterPath       = null,
+                    AfterName       = null,
+                    Status          = RelocationStatus.Skipped,
+                    ErrorMessage    = $"duplicate of {keeperPath}",
+                    CompletedAtUtc  = DateTime.UtcNow
+                };
+                await _relocRepo.CreateAsync(dupRec, ct);
+                relocations.Add(dupRec);
+                continue;
+            }
 
             var rule = plan.Rules.FirstOrDefault(r =>
                 r.DocumentType == file.DocumentType &&
@@ -154,18 +189,35 @@ public sealed partial class StructureExecutionService : IStructureExecutionServi
             };
             try
             {
-                // Always copy — the original at BeforePath remains untouched.
-                if (File.Exists(file.OriginalFilePath))
-                    File.Copy(file.OriginalFilePath, newPath, overwrite: false);
-
-                fileRec.Status = RelocationStatus.Succeeded;
-                fileRec.CompletedAtUtc = DateTime.UtcNow;
-
-                // Post-move integrity hash for audit; non-fatal on failure.
-                if (File.Exists(newPath))
+                // Resolve any existing-target collision per the configured policy.
+                var resolved = ResolveCollision(newPath, _materialization.CollisionPolicy);
+                if (string.IsNullOrEmpty(resolved))
                 {
-                    var hashRes = await _hash.ComputeAsync(newPath, ct);
-                    if (hashRes.IsSuccess) fileRec.ContentHashAfter = hashRes.Value;
+                    fileRec.Status         = RelocationStatus.Skipped;
+                    fileRec.ErrorMessage   = "Destination already exists; skipped per policy.";
+                    fileRec.CompletedAtUtc = DateTime.UtcNow;
+                }
+                else
+                {
+                    if (!resolved.Equals(newPath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        fileRec.AfterPath = resolved;
+                        fileRec.AfterName = Path.GetFileName(resolved);
+                    }
+
+                    // Always copy — the original at BeforePath remains untouched.
+                    if (File.Exists(file.OriginalFilePath))
+                        File.Copy(file.OriginalFilePath, resolved, overwrite: false);
+
+                    fileRec.Status = RelocationStatus.Succeeded;
+                    fileRec.CompletedAtUtc = DateTime.UtcNow;
+
+                    // Post-move integrity hash for audit; non-fatal on failure.
+                    if (File.Exists(resolved))
+                    {
+                        var hashRes = await _hash.ComputeAsync(resolved, ct);
+                        if (hashRes.IsSuccess) fileRec.ContentHashAfter = hashRes.Value;
+                    }
                 }
             }
             catch (Exception ex)
@@ -276,6 +328,166 @@ public sealed partial class StructureExecutionService : IStructureExecutionServi
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Computes the same set of relocations <see cref="ExecuteStructureAsync"/>
+    /// would produce and persists them with <c>Status = Pending</c> — without
+    /// touching the file system. Used by the UI for layout previews.
+    /// </summary>
+    public async Task<Result<IReadOnlyList<FileRelocationRecord>>> PlanRelocationsAsync(
+        Guid cleaningId, CancellationToken ct = default)
+    {
+        var cleaningResult = await _cleaningRepo.GetByIdAsync(cleaningId, ct);
+        if (cleaningResult.IsFailed) return Result.Fail(cleaningResult.Errors);
+
+        var planResult = await _planRepo.GetLatestAsync(cleaningId, ct);
+        if (planResult.IsFailed) return Result.Fail(planResult.Errors);
+
+        var filesResult = await _redactedRepo.GetByCleaningIdAsync(cleaningId, ct);
+        if (filesResult.IsFailed) return Result.Fail(filesResult.Errors);
+
+        var cleaning = cleaningResult.Value;
+        var plan     = planResult.Value;
+        var files    = filesResult.Value;
+
+        var executionRoot = cleaning.ExecutionTarget == ExecutionTarget.AlternatePath
+            && !string.IsNullOrWhiteSpace(cleaning.AlternateExecutionPath)
+            ? cleaning.AlternateExecutionPath!
+            : cleaning.RootPath;
+
+        var (nonKeepers, keeperPathById) = await ResolveDuplicatesAsync(cleaningId, files, ct);
+        var planned = new List<FileRelocationRecord>();
+
+        foreach (var file in files)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (nonKeepers.TryGetValue(file.Id, out var keeperId))
+            {
+                var keeperPath = keeperPathById.TryGetValue(keeperId, out var p) ? p : "(unknown)";
+                var dupRec = new FileRelocationRecord
+                {
+                    CleaningId      = cleaningId,
+                    RedactedFileId  = file.Id,
+                    OperationType   = RelocationOperationType.SkipDuplicate,
+                    ExecutionTarget = cleaning.ExecutionTarget,
+                    BeforePath      = file.OriginalFilePath,
+                    BeforeName      = file.OriginalFileName,
+                    Status          = RelocationStatus.Pending,
+                    ErrorMessage    = $"duplicate of {keeperPath}"
+                };
+                await _relocRepo.CreateAsync(dupRec, ct);
+                planned.Add(dupRec);
+                continue;
+            }
+
+            var rule = plan.Rules.FirstOrDefault(r =>
+                r.DocumentType == file.DocumentType &&
+                (string.IsNullOrEmpty(r.Extension) ||
+                 r.Extension.Equals(file.Extension, StringComparison.OrdinalIgnoreCase)))
+                ?? plan.Rules.FirstOrDefault(r => r.DocumentType == file.DocumentType);
+
+            if (rule is null)
+            {
+                var miss = new FileRelocationRecord
+                {
+                    CleaningId      = cleaningId,
+                    RedactedFileId  = file.Id,
+                    OperationType   = RelocationOperationType.Materialize,
+                    ExecutionTarget = cleaning.ExecutionTarget,
+                    BeforePath      = file.OriginalFilePath,
+                    BeforeName      = file.OriginalFileName,
+                    Status          = RelocationStatus.Pending,
+                    ErrorMessage    = "No matching rule."
+                };
+                await _relocRepo.CreateAsync(miss, ct);
+                planned.Add(miss);
+                continue;
+            }
+
+            var tokens = BuildTokenMap(file);
+            var folderRel = SubstituteTokens(rule.FolderPathTemplate, tokens);
+            var fileBase  = SubstituteTokens(rule.FileNameTemplate,  tokens);
+            var newName   = $"{fileBase}{file.Extension}";
+            var newDir    = Path.Combine(executionRoot, folderRel);
+            var newPath   = Path.Combine(newDir, newName);
+
+            var rec = new FileRelocationRecord
+            {
+                CleaningId      = cleaningId,
+                RedactedFileId  = file.Id,
+                OperationType   = RelocationOperationType.Materialize,
+                ExecutionTarget = cleaning.ExecutionTarget,
+                BeforePath      = file.OriginalFilePath,
+                BeforeName      = file.OriginalFileName,
+                AfterPath       = newPath,
+                AfterName       = newName,
+                Status          = RelocationStatus.Pending
+            };
+            await _relocRepo.CreateAsync(rec, ct);
+            planned.Add(rec);
+        }
+
+        await _audit.LogAsync("StructurePlanned", "Cleaning",
+            cleaningId.ToString(), action: "PlanRelocations",
+            newValues: new { Total = planned.Count });
+
+        return Result.Ok<IReadOnlyList<FileRelocationRecord>>(planned);
+    }
+
+    /// <summary>
+    /// Returns a lookup of redacted-file ids that should be skipped because
+    /// they are non-keeper members of a duplicate group, plus the original
+    /// path of each elected keeper for audit messages.
+    /// </summary>
+    private async Task<(Dictionary<Guid, Guid> NonKeepers, Dictionary<Guid, string> KeeperPaths)>
+        ResolveDuplicatesAsync(
+            Guid cleaningId,
+            IReadOnlyList<RedactedFileDescriptor> files,
+            CancellationToken ct)
+    {
+        var nonKeepers   = new Dictionary<Guid, Guid>();
+        var keeperPaths  = new Dictionary<Guid, string>();
+        if (!_materialization.DeduplicateByContentHash) return (nonKeepers, keeperPaths);
+
+        var dupResult = await _dupes.AnalyzeAsync(cleaningId, ct);
+        if (dupResult.IsFailed) return (nonKeepers, keeperPaths);
+
+        var byId = files.ToDictionary(f => f.Id);
+        foreach (var g in dupResult.Value)
+        {
+            if (byId.TryGetValue(g.KeepRedactedFileId, out var keeper))
+                keeperPaths[g.KeepRedactedFileId] = keeper.OriginalFilePath;
+
+            foreach (var id in g.RedactedFileIds)
+                if (id != g.KeepRedactedFileId) nonKeepers[id] = g.KeepRedactedFileId;
+        }
+        return (nonKeepers, keeperPaths);
+    }
+
+    /// <summary>
+    /// Applies the configured <see cref="MaterializationCollisionPolicy"/>.
+    /// Returns the path the caller should write to, or <see cref="string.Empty"/>
+    /// when the policy is <see cref="MaterializationCollisionPolicy.Skip"/>.
+    /// </summary>
+    private static string ResolveCollision(string newPath, MaterializationCollisionPolicy policy)
+    {
+        if (!File.Exists(newPath)) return newPath;
+        if (policy == MaterializationCollisionPolicy.Fail)
+            throw new IOException($"Destination already exists: {newPath}");
+        if (policy == MaterializationCollisionPolicy.Skip)
+            return string.Empty;
+
+        var dir  = Path.GetDirectoryName(newPath)!;
+        var stem = Path.GetFileNameWithoutExtension(newPath);
+        var ext  = Path.GetExtension(newPath);
+        for (int i = 2; i < 1000; i++)
+        {
+            var candidate = Path.Combine(dir, $"{stem}_({i}){ext}");
+            if (!File.Exists(candidate)) return candidate;
+        }
+        throw new IOException($"Collision suffix space exhausted for {newPath}");
+    }
 
     private Dictionary<string, string> BuildTokenMap(RedactedFileDescriptor file)
     {

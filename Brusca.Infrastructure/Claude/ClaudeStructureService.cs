@@ -49,20 +49,57 @@ public sealed class ClaudeStructureService : IClaudeStructureService
     public async Task<DirectoryStructurePlan> AnalyzeStructureAsync(
         Guid cleaningId,
         IReadOnlyList<DocumentTypeSummary> summaries,
+        PiiSlotCatalog? slotCatalog = null,
         CancellationToken ct = default)
     {
-        var payload = JsonSerializer.Serialize(summaries.Select(s => new
+        var payload = JsonSerializer.Serialize(new
         {
-            documentType = s.DocumentType.ToString(),
-            extension    = s.Extension,
-            count        = s.Count
-        }));
+            documents = summaries.Select(s => new
+            {
+                documentType = s.DocumentType.ToString(),
+                extension    = s.Extension,
+                count        = s.Count
+            }),
+            availableSlotsPerDocumentType = slotCatalog?.Entries.Select(e => new
+            {
+                documentType   = e.DocumentType.ToString(),
+                availableSlots = e.AvailableKinds.Select(k => k.ToString()).ToArray()
+            }) ?? Enumerable.Empty<object>()
+        });
 
         var raw = await CompleteAsync(SystemPrompt,
-            "Anonymized document inventory:\n" + payload, ct);
+            "Anonymized inventory + per-type slot vocabulary:\n" + payload, ct);
 
-        return ParsePlan(cleaningId, raw);
+        var plan = ParsePlan(cleaningId, raw);
+        if (slotCatalog is not null) FilterUnknownSlots(plan, slotCatalog);
+        return plan;
     }
+
+    /// <summary>
+    /// Drops any <c>RequiredTokenSlots</c> entry that the catalog cannot
+    /// satisfy for the rule's <c>DocumentType</c>. Universal slots
+    /// (Year/Month/Day/Date/Extension/DocumentType) are always allowed
+    /// because the host derives them itself.
+    /// </summary>
+    private static void FilterUnknownSlots(DirectoryStructurePlan plan, PiiSlotCatalog catalog)
+    {
+        var allowed = catalog.Entries.ToDictionary(
+            e => e.DocumentType,
+            e => new HashSet<string>(
+                e.AvailableKinds.Select(k => k.ToString()),
+                StringComparer.OrdinalIgnoreCase));
+
+        foreach (var rule in plan.Rules)
+        {
+            if (!allowed.TryGetValue(rule.DocumentType, out var ok)) continue;
+            rule.RequiredTokenSlots = rule.RequiredTokenSlots
+                .Where(s => ok.Contains(s) || IsUniversalSlot(s))
+                .ToList();
+        }
+    }
+
+    private static bool IsUniversalSlot(string s) =>
+        s is "Year" or "Month" or "Day" or "Date" or "Extension" or "DocumentType";
 
     private async Task<string> CompleteAsync(
         string systemPrompt, string userPrompt, CancellationToken ct)

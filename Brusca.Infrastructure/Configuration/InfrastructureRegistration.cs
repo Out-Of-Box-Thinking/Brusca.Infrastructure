@@ -30,6 +30,7 @@ public static class InfrastructureRegistration
         services.AddScoped<IRedactedFileRepository, RedactedFileRepository>();
         services.AddScoped<IStructurePlanRepository, StructurePlanRepository>();
         services.AddScoped<IFileRelocationRepository, FileRelocationRepository>();
+        services.AddScoped<IPromotionRepository, PromotionRepository>();
 
         // Services
         services.AddScoped<ICleaningService, CleaningService>();
@@ -40,12 +41,20 @@ public static class InfrastructureRegistration
         services.AddScoped<IPiiRehydrationService, PiiRehydrationService>();
         services.AddScoped<IDocumentTypeClassifier, HeuristicDocumentTypeClassifier>();
         services.AddScoped<IStructureExecutionService, StructureExecutionService>();
+        services.AddScoped<IDuplicateDetectionService, DuplicateDetectionService>();
         services.AddSingleton<IFileHashService, Sha256FileHashService>();
 
         // Image redaction is Windows-only (GDI+). Register only on Windows so
         // non-Windows hosts can substitute their own IImageRedactionService.
         if (OperatingSystem.IsWindows())
             services.AddSingleton<IImageRedactionService, GdiImageRedactionService>();
+
+        // Promotion (recycle-bin finalisation) is Windows-only because the
+        // underlying Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile API
+        // is only supported on Windows. Non-Windows hosts simply lack this
+        // service and CleaningService.PromoteCleaningAsync returns a failure.
+        if (OperatingSystem.IsWindows())
+            services.AddScoped<IPromotionService, PromotionService>();
 
         // Encryption — ASP.NET Core Data Protection seals the PII JSON column.
         var pii = configuration.GetSection("Brusca:Pii").Get<PiiOptions>() ?? new PiiOptions();

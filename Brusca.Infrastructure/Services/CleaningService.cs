@@ -28,6 +28,8 @@ public sealed class CleaningService : ICleaningService
     private readonly IEncryptionService _crypto;
     private readonly IClaudeStructureService _claudeStructure;
     private readonly IStructureExecutionService _structureExec;
+    private readonly IDuplicateDetectionService _dupes;
+    private readonly IPromotionService? _promotion;
     private readonly ClaudePromptService _claude;
     private readonly IAuditLogger _audit;
     private readonly IErrorLogger _log;
@@ -47,9 +49,11 @@ public sealed class CleaningService : ICleaningService
         IEncryptionService crypto,
         IClaudeStructureService claudeStructure,
         IStructureExecutionService structureExec,
+        IDuplicateDetectionService dupes,
         ClaudePromptService claude,
         IAuditLogger audit,
-        IErrorLogger log)
+        IErrorLogger log,
+        IPromotionService? promotion = null)
     {
         _cleaningRepo    = cleaningRepo;
         _promptRepo      = promptRepo;
@@ -65,6 +69,8 @@ public sealed class CleaningService : ICleaningService
         _crypto          = crypto;
         _claudeStructure = claudeStructure;
         _structureExec   = structureExec;
+        _dupes           = dupes;
+        _promotion       = promotion;
         _claude          = claude;
         _audit           = audit;
         _log             = log;
@@ -383,6 +389,16 @@ public sealed class CleaningService : ICleaningService
             };
 
             await _redactedRepo.CreateAsync(descriptor, ct);
+
+            // Record per-file PiiKind set so the slot catalog can be assembled later.
+            if (redactionResult.Value.Segments.Count > 0)
+            {
+                await _redactedRepo.SaveDetectedPiiKindsAsync(
+                    descriptor.Id,
+                    redactionResult.Value.Segments.Select(s => s.Kind).Distinct(),
+                    ct);
+            }
+
             descriptors.Add(descriptor);
         }
 
@@ -403,8 +419,13 @@ public sealed class CleaningService : ICleaningService
         if (summariesResult.Value.Count == 0)
             return Result.Fail("No redacted descriptors exist — run RedactAndClassify first.");
 
+        // Slot catalog tells Claude which PII tokens it may legitimately reference
+        // per DocumentType. Failure to load is non-fatal — we just send no catalog.
+        var slotResult = await _redactedRepo.GetSlotCatalogAsync(cleaningId, ct);
+        var slotCatalog = slotResult.IsSuccess ? slotResult.Value : null;
+
         var plan = await _claudeStructure.AnalyzeStructureAsync(
-            cleaningId, summariesResult.Value, ct);
+            cleaningId, summariesResult.Value, slotCatalog, ct);
 
         // Replace any prior plan
         await _planRepo.DeleteByCleaningIdAsync(cleaningId, ct);
@@ -456,6 +477,39 @@ public sealed class CleaningService : ICleaningService
         await _audit.LogAsync("CleaningArchived", "Cleaning",
             cleaningId.ToString(), userId: userId, action: "Archive");
         return Result.Ok();
+    }
+
+    // ── Cowork-parity additions ──────────────────────────────────────────────
+
+    public Task<Result<IReadOnlyList<FileRelocationRecord>>> PlanStructureRelocationsAsync(
+        Guid cleaningId, CancellationToken ct = default)
+        => _structureExec.PlanRelocationsAsync(cleaningId, ct);
+
+    public Task<Result<IReadOnlyList<DuplicateGroup>>> AnalyzeDuplicatesAsync(
+        Guid cleaningId, CancellationToken ct = default)
+        => _dupes.AnalyzeAsync(cleaningId, ct);
+
+    public Task<Result<IReadOnlyList<PromotionRecord>>> PromoteCleaningAsync(
+        Guid cleaningId, string userId, CancellationToken ct = default)
+    {
+        if (_promotion is null)
+        {
+            return Task.FromResult(
+                Result.Fail<IReadOnlyList<PromotionRecord>>(
+                    "Promotion is unavailable on this host (Windows-only feature)."));
+        }
+        return _promotion.PromoteAsync(cleaningId, userId, ct);
+    }
+
+    public Task<Result<IReadOnlyList<PromotionRecord>>> GetPromotionsAsync(
+        Guid cleaningId, CancellationToken ct = default)
+    {
+        if (_promotion is null)
+        {
+            return Task.FromResult(
+                Result.Ok<IReadOnlyList<PromotionRecord>>([]));
+        }
+        return _promotion.GetPromotionsAsync(cleaningId, ct);
     }
 }
 
